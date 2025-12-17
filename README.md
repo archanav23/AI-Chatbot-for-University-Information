@@ -1,1 +1,2 @@
 # AI-Chatbot-for-University-Information
+This project is an AI-powered chatbot designed to provide quick and accurate university-related information such as exams, results, and academic queries. The chatbot was developed and tested using Jupyter Notebook, with data stored and managed in Azure SQL Database. The application is deployed on Streamlit Cloud to provide an interactive web-based interface. All Python source files and project resources are maintained and version-controlled using GitHub.
