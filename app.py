@@ -1,109 +1,138 @@
-import pyodbc
+import pandas as pd
 import streamlit as st
 import re
-from sklearn.model_selection import train_test_split
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from pathlib import Path
+from sentence_transformers import SentenceTransformer, util
 
-# 1. Connect to AZURE SQL DATABASE
+# 1. Load Data
 
-conn = pyodbc.connect(
-    "Driver={ODBC Driver 17 for SQL Server};"
-    f"Server={st.secrets['DB_SERVER']};"
-    f"Database={st.secrets['DB_NAME']};"
-    f"Uid={st.secrets['DB_USER']};"
-    f"Pwd={st.secrets['DB_PASSWORD']};"
-    "Encrypt=yes;"
-    "TrustServerCertificate=no;"
-    "Connection Timeout=30;"
-)
-cursor = conn.cursor()
+@st.cache_data
+def load_data():
+    df = pd.read_csv('Chatbot Data.csv')
+    questions = [str(q).strip() for q in df['question'].tolist()]
+    answers   = [str(a).strip() for a in df['answer'].tolist()]
+    return questions, answers
 
-# 2. Fetch Questions and Answers
+# 2. Load Best Semantic Model
 
-cursor.execute("SELECT question, answer FROM faq WHERE question IS NOT NULL AND answer IS NOT NULL")
-data = cursor.fetchall()
+@st.cache_resource
+def load_model():
+    # all-mpnet-base-v2 is the highest accuracy
+    # sentence-transformer model available
+    return SentenceTransformer('all-mpnet-base-v2')
 
-questions = [str(row[0]).strip() for row in data]
-answers = [str(row[1]).strip() for row in data]
+# 3. Pre-compute Embeddings for Questions + Answers
 
-# 3. Normalize Text
+@st.cache_resource
+def get_embeddings(_model, questions, answers):
+    q_embeddings = _model.encode(questions, convert_to_tensor=True)
+    a_embeddings = _model.encode(answers,   convert_to_tensor=True)
+    return q_embeddings, a_embeddings
 
-def normalize_text(s):
-    s = s.lower()
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# 4. Clean Text
 
-questions_norm = [normalize_text(q) for q in questions]
-questions_tokens = [set(q.split()) for q in questions_norm]
+def clean(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
 
-# 4. TF-IDF Vectorization
 
-vectorizer = TfidfVectorizer(ngram_range=(1,2), stop_words='english')
-X = vectorizer.fit_transform(questions_norm)
+# 5. Keyword Boost
 
-# 5. Chatbot Logic
+def keyword_boost(user_input: str, questions: list) -> np.ndarray:
+    user_words  = set(clean(user_input).split())
+    boost       = np.zeros(len(questions))
+    stopwords   = {'what','when','where','how','why','who','is',
+                   'the','a','an','i','my','can','do','did','are',
+                   'in','of','for','to','get','me','will','be','it'}
+    # Only keep meaningful words
+    user_words -= stopwords
 
-def chatbot_response(user_input):
-    u_norm = normalize_text(user_input)
-    u_tokens = set(u_norm.split())
+    for i, q in enumerate(questions):
+        q_words = set(clean(q).split())
+        overlap = user_words & q_words
+        if overlap:
+            # Boost proportional to overlap
+            boost[i] = len(overlap) / max(len(user_words), 1) * 0.15
 
-    strong_phrases = [
-        'exam timetable','exam schedule','exam date','semester exam','exam duration',
-        'admit card','hall ticket','syllabus','time table',
-        'exam result','marksheet','marks','cgpa','gpa',
-        'exam registration','exam fee',
-        'revaluation','rechecking','backlog','supplementary',
-        'degree certificate','provisional certificate','migration certificate',
-        'attendance shortage','minimum attendance',
-        'practical exam','lab exam','viva',
-        'error in marks','discrepancy',
-        'calculator','exam hall','mobile phone',
-        'late for exam','missed exam',
-        'online exam portal','student login',
-        'duplicate mark sheet','duplicate degree',
-        'convocation','graduation ceremony',
-        'fee receipt','fee payment issues'
-    ]
+    return boost
 
-    for phrase in strong_phrases:
-        if phrase in u_norm:
-            for i, q_norm in enumerate(questions_norm):
-                if phrase in q_norm:
-                    return answers[i]
+# 6. Main Response Function
 
-    best_overlap_idx = -1
-    best_overlap = 0.0
-    for i, qtoks in enumerate(questions_tokens):
-        if len(u_tokens) == 0:
-            overlap = 0.0
-        else:
-            overlap = len(u_tokens & qtoks) / len(u_tokens)
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_overlap_idx = i
+def chatbot_response(user_input, questions, answers, model, q_embeddings, a_embeddings):
+    if not user_input or len(user_input.strip()) < 3:
+        return "Please ask a complete question."
 
-    if best_overlap > 0.4:
-        return answers[best_overlap_idx]
+    # Encode user question
+    user_embedding = model.encode(user_input, convert_to_tensor=True)
 
-    user_vec = vectorizer.transform([u_norm])
-    sims = cosine_similarity(user_vec, X).flatten()
-    top_idx = sims.argmax()
+    # Semantic similarity against questions (primary)
+    q_scores = util.cos_sim(user_embedding, q_embeddings)[0].cpu().numpy()
 
-    if sims[top_idx] > 0.25:
-        return answers[top_idx]
+    # Semantic similarity against answers (secondary)
+    a_scores = util.cos_sim(user_embedding, a_embeddings)[0].cpu().numpy()
 
-    return "I'm not sure about that."
+    # Keyword boost
+    boost = keyword_boost(user_input, questions)
 
-# 6. STREAMLIT UI
+    # Final score:
+    # 70% question match + 20% answer match + 10% keyword boost
+    final_scores = (0.70 * q_scores) + (0.20 * a_scores) + boost
 
-st.set_page_config(page_title="University AI Chatbot")
+    # Get top 3 candidates
+    top3_idx = np.argsort(final_scores)[::-1][:3]
+    best_idx  = top3_idx[0]
+    best_score = final_scores[best_idx]
 
-st.title("AI Chatbot for University Information")
+    # Dynamic threshold — if best score is decent, return it
+    THRESHOLD = 0.25
 
-user_question = st.text_input("Ask your question:")
+    if best_score >= THRESHOLD:
+        return answers[best_idx]
+
+    # Last resort — if semantic fails, return closest question's answer anyway
+    # (because user is clearly asking about university topics)
+    if q_scores[best_idx] > 0.15:
+        return answers[best_idx]
+
+    return (
+        "Sorry, I could not find relevant information for your question. "
+        "Please rephrase or contact the university administration."
+    )
+
+# 7. Streamlit UI
+
+st.set_page_config(page_title="University AI Chatbot", layout="centered")
+st.title("🎓 University Information Chatbot")
+st.write("Ask anything about exams, results, attendance, fees, and more!")
+
+# Load everything
+questions, answers       = load_data()
+model                    = load_model()
+q_embeddings, a_embeddings = get_embeddings(model, questions, answers)
+
+# Chat input
+user_question = st.text_input("Your Question:", placeholder="e.g. When will my results come?")
 
 if user_question:
-    response = chatbot_response(user_question)
-    st.write("**Chatbot:**", response)
+    with st.spinner("Finding best answer..."):
+        response = chatbot_response(
+            user_question, questions, answers,
+            model, q_embeddings, a_embeddings
+        )
+    st.markdown(f"**🤖 Chatbot:** {response}")
+
+# Sample questions
+st.markdown("---")
+st.markdown("💡 **What are your queries?**")
+samples = [
+    "Tell me about exam dates",
+    "How do I get my admit card?",
+    "What score do I need to pass?",
+    "My marksheet has wrong marks",
+    "How many days to get duplicate marksheet?",
+]
+for s in samples:
+    st.write(f"• {s}")
