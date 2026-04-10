@@ -1,4 +1,6 @@
 streamlit
-pyodbc
+pandas
 scikit-learn
+sentence-transformers
 numpy
+torch
